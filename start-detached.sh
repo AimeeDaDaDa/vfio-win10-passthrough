@@ -41,6 +41,9 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
+echo "--- 同步已插入的 USB 设备进 VM ---"
+/usr/local/bin/vfio-usb-hotplug.sh sync
+
 echo "--- 最终域状态 ---"
 virsh list --all 2>&1
 

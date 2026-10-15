@@ -1,0 +1,1 @@
+ACTION=="add|remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", RUN+="/usr/local/bin/vfio-usb-hotplug.sh %p %E{ACTION}"
