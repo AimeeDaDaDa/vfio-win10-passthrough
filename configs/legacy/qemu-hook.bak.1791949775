@@ -1,0 +1,122 @@
+#!/bin/bash
+# ============================================================
+# libvirt hook —— win10-game 单显卡直通：设备动态绑定管理
+# 由 libvirtd 自动调用: /etc/libvirt/hooks/qemu <domain> <action>
+#
+#   prepare  VM 启动前：结束桌面会话释放 GPU → 解绑 GPU/NVMe/USB → 绑 vfio-pci
+#   release  VM 退出后：解绑 vfio → 还原宿主机原驱动 → 恢复图形登录界面
+#
+# 支持两种模式（自动识别，无需配置）：
+#   动态模式（默认）：宿主机平时正常用桌面，VM 运行时抢走设备
+#   开机绑定模式：设备已在启动时绑死 vfio（/etc/modprobe.d/vfio-pci.conf），hook 不动它们
+#
+# 日志: /var/log/vm-passthrough.log
+# ============================================================
+VM="win10-game"
+[ "$1" = "$VM" ] || exit 0
+ACTION="$2"
+
+GPU="0000:01:00.0 0000:01:00.1"
+NVME="0000:03:00.0"
+USB="0000:00:14.0 0000:00:14.2"
+ALL="$GPU $NVME $USB"
+STATE_DIR=/run/vm-passthrough
+LOG=/var/log/vm-passthrough.log
+
+log() { echo "$(date '+%F %T') [$ACTION] $*" >> "$LOG" 2>/dev/null; }
+cur_driver() { readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null | xargs -r basename; }
+
+stop_desktop() {
+    # 结束图形会话，释放 GPU（只动 x11/wayland 会话，不动 SSH 会话）
+    for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        t=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
+        if [ "$t" = "x11" ] || [ "$t" = "wayland" ]; then
+            loginctl terminate-session "$sid" 2>/dev/null
+        fi
+    done
+    local dm
+    dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null | xargs -r basename)
+    [ -n "$dm" ] && systemctl stop "$dm" 2>/dev/null
+    systemctl stop nvidia-persistenced 2>/dev/null
+    # framebuffer 若绑在 nvidia 上，nvidia 无法解绑 —— 先解掉
+    for vc in /sys/class/vtconsole/vtcon*; do
+        if grep -qi nvidia "$vc/bind" 2>/dev/null; then
+            echo 0 > "$vc/bind" 2>/dev/null
+        fi
+    done
+    sleep 1
+}
+
+start_desktop() {
+    local dm
+    dm=$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null | xargs -r basename)
+    [ -n "$dm" ] && systemctl start "$dm" 2>/dev/null
+}
+
+case "$ACTION" in
+prepare)
+    mkdir -p "$STATE_DIR"
+    # NVMe 若被宿主机挂载，先卸载
+    for p in /dev/nvme1n1p*; do
+        [ -b "$p" ] && umount "$p" 2>/dev/null
+    done
+
+    # 第一遍：判定每个设备是 hook 模式（当前在宿主驱动上）还是开机绑定模式（已在 vfio）
+    took_gpu=0
+    for d in $ALL; do
+        cur=$(cur_driver "$d")
+        if [ "$cur" = "vfio-pci" ]; then
+            echo boot > "$STATE_DIR/$d"
+        else
+            echo "$cur" > "$STATE_DIR/$d.drv"
+            echo hook > "$STATE_DIR/$d"
+        fi
+    done
+
+    # 只有确实要从桌面拿走 GPU 时，才结束桌面会话
+    if [ "$(cat "$STATE_DIR/0000:01:00.0" 2>/dev/null)" = "hook" ]; then
+        stop_desktop
+        took_gpu=1
+    fi
+
+    # 第二遍：解绑 hook 模式的设备
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null
+    done
+
+    # 第三遍：统一绑到 vfio-pci
+    modprobe vfio-pci 2>/dev/null
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        echo vfio-pci > "/sys/bus/pci/devices/$d/driver_override"
+        echo "$d" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null
+    done
+
+    echo "$took_gpu" > "$STATE_DIR/gpu_taken"
+    log "设备已接管（vfio-pci），gpu_taken=$took_gpu"
+    ;;
+
+release)
+    # 只还原 hook 模式接管的设备；开机绑定模式的设备保持 vfio 不动
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null
+        echo "" > "/sys/bus/pci/devices/$d/driver_override"
+    done
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        drv=$(cat "$STATE_DIR/$d.drv" 2>/dev/null)
+        [ -z "$drv" ] && drv=nvidia
+        [ -d "/sys/bus/pci/drivers/$drv" ] && echo "$d" > "/sys/bus/pci/drivers/$drv/bind" 2>/dev/null
+        rm -f "$STATE_DIR/$d" "$STATE_DIR/$d.drv"
+    done
+    if [ "$(cat "$STATE_DIR/gpu_taken" 2>/dev/null)" = "1" ]; then
+        sleep 1
+        start_desktop
+    fi
+    rm -f "$STATE_DIR/gpu_taken"
+    log "设备已归还宿主机"
+    ;;
+esac
+exit 0

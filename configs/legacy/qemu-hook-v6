@@ -1,0 +1,288 @@
+#!/bin/bash
+# ============================================================
+# libvirt hook v4 —— win10-game 单显卡直通：设备动态绑定管理
+# 由 libvirtd 自动调用: /etc/libvirt/hooks/qemu <domain> <action>
+#
+# 【v4 关键修正】宿主内核控制台 framebuffer 挂在 RTX 3050 上
+#   实测：/proc/fb = "0 nvidia-drmdrmfb"，fbcon primary device 就是这张卡。
+#   只做 PCI 层 unbind 不够 —— nvidia_drm 模块连同它的 framebuffer 还活着，
+#   GPU 交给 vfio-pci 后内核再往那块显存写字符 = 整机当场挂死
+#   （上一次开机日志停在 vfio-pci ... vgaarb: deactivate vga console 之后，3 分钟无输出）。
+#   所以必须把 nvidia 模块整组 modprobe -r 卸掉，而不只是解绑 PCI。
+#
+# 【安全红线】卸载失败就 exit 1 中止，绝不硬上。宁可 VM 起不来，也不让宿主机挂死。
+#   （注意：成功时是 modprobe -r 把 PCI 设备一并放手的，所以卸载成功后再解绑是幂等的）
+#
+# 【其他硬性约束 —— 都是踩过的坑】
+#   1. 不用 loginctl terminate-session：hook 跑在 libvirtd 进程树里，会把自己一起杀掉。
+#      改用 systemctl isolate multi-user.target。
+#   2. NVME 必须是 0000:02:00.0（Biwin 476G）。
+#      0000:03:00.0 是 Linux 根盘，直通它 = 宿主机当场挂死。
+#   3. vtconsole 判据要看 name 而不是 bind（bind 是状态位，永远不含驱动名）。
+#
+# 日志: /var/log/libvirt/qemu-hook.log（落盘持久化，重启不丢）+ /run/vm-passthrough/hook.log
+# ============================================================
+VM="win10-game"
+[ "$1" = "$VM" ] || exit 0
+ACTION="$2"
+
+GPU="0000:01:00.0 0000:01:00.1"
+NVME="0000:02:00.0"
+# ★ 不再直通 USB 控制器：会令 OVMF 卡死在 TianoCore logo
+# 键鼠改走「设备级直通」（<hostdev type='usb'>），USB 控制器留给宿主机
+USB=""
+ALL="$GPU $NVME"
+STATE_DIR=/run/vm-passthrough
+LOG="$STATE_DIR/hook.log"
+PLOG=/var/log/libvirt/qemu-hook.log
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+log() {
+    local m="$(date '+%F %T') [$ACTION] $*"
+    echo "$m" >> "$LOG" 2>/dev/null
+    echo "$m" >> "$PLOG" 2>/dev/null
+    # 立刻落盘：万一下一刻整机死锁，这行必须已经在盘上
+    sync -d "$PLOG" 2>/dev/null || sync "$PLOG" 2>/dev/null || true
+}
+# 【踩坑】设备无驱动时 /sys/bus/pci/devices/X/driver 这个符号链接并不存在，
+# 而 readlink -f 会原样回显入参路径，basename 后得到字符串 "driver"（假的！）。
+# 结果 wait_unbind 永远等不到"空"，每次白等 10 秒；日志也误报"有驱动"。
+# 必须用不带 -f 的 readlink，让无驱动时返回空。
+cur_driver() {
+    local r
+    r=$(readlink "/sys/bus/pci/devices/$1/driver" 2>/dev/null) || return 0
+    [ -n "$r" ] && basename "$r"
+    return 0
+}
+dm_name() { readlink -f /etc/systemd/system/display-manager.service 2>/dev/null | xargs -r basename; }
+snap() { local d; for d in $ALL; do log "    绑定快照 $d -> $(cur_driver "$d" 2>/dev/null || echo 无驱动)"; done; }
+
+# ---------- 保险 1：拒绝直通承载已挂载文件系统的存储设备（防根盘事故）----------
+safety_check() {
+    local d b name bad=0
+    for d in $NVME; do
+        for b in /sys/bus/pci/devices/$d/nvme/*/block/* /sys/bus/pci/devices/$d/block/*; do
+            [ -e "$b" ] || continue
+            name=$(basename "$b")
+            if grep -q "^/dev/$name" /proc/mounts; then
+                log "!!!! 拒绝直通 $d ($name)：其上有已挂载文件系统（可能是根盘！）"
+                bad=1
+            fi
+        done
+    done
+    [ "$bad" = 1 ] && { log "!!!! safety_check 未通过，中止。"; return 1; }
+    return 0
+}
+
+stop_desktop() {
+    log "停图形 target（不 terminate 会话，避免自杀）"
+    systemctl isolate multi-user.target 2>/dev/null
+    local dm; dm=$(dm_name)
+    [ -n "$dm" ] && systemctl stop "$dm" 2>/dev/null
+    log "停 nvidia-persistenced / suspend-resume 单元"
+    systemctl stop nvidia-persistenced.service nvidia-suspend.service \
+                   nvidia-hibernate.service nvidia-resume.service 2>/dev/null
+    sleep 2
+}
+
+# ---------- 释放内核控制台 framebuffer ----------
+release_fbcon() {
+    local vc vname n
+    # a) 解掉 vtconsole（判据看 name，不看 bind）
+    for vc in /sys/class/vtconsole/vtcon*; do
+        vname=$(cat "$vc/name" 2>/dev/null)
+        [ -z "$vname" ] && continue
+        log "  vtconsole $(basename $vc): name='$vname'"
+        if echo "$vname" | grep -qi "frame buffer"; then
+            echo 0 > "$vc/bind" 2>/dev/null && log "  已解绑 $(basename $vc)"
+        fi
+    done
+    # b) 解绑 simpledrm（开机 UEFI GOP 的 framebuffer）
+    for n in /sys/bus/platform/drivers/simpledrm/*; do
+        [ -e "$n" ] || continue
+        n=$(basename "$n")
+        if echo "$n" > /sys/bus/platform/drivers/simpledrm/unbind 2>/dev/null; then
+            log "  已解绑 simpledrm: $n"
+        else
+            log "  !! simpledrm: $n 解绑失败（可能已被 nvidia 取代，无害）"
+        fi
+    done
+}
+
+# ---------- 卸载 nvidia 模块（v4 的核心修复）----------
+unload_nvidia() {
+    log "开始卸载 nvidia 模块（引用计数前）"
+    log "    $(lsmod | grep -E '^nvidia' | tr '\n' '|')"
+    log "    占用 /dev/nvidia* 的进程：" $(fuser /dev/nvidia* 2>/dev/null | tr '\n' ' ')
+    # 兜底：清掉残留占用者（桌面已停，这里通常只剩零散进程）
+    fuser -k /dev/nvidia* >/dev/null 2>&1
+    sleep 1
+    for i in $(seq 1 10); do
+        if modprobe -r nvidia_uvm 2>/dev/null; then :; fi
+        if modprobe -r nvidia_drm 2>/dev/null; then :; fi
+        if modprobe -r nvidia_modeset 2>/dev/null; then :; fi
+        if modprobe -r nvidia 2>/dev/null; then
+            log "  第 $i 轮：nvidia 模块已全部卸载"
+            log "    卸载后 $(lsmod | grep -cE '^nvidia') 个 nvidia 模块残留"
+            return 0
+        fi
+        sleep 1.5
+    done
+    log "!!!! nvidia 模块卸载失败（尝试 10 轮）"
+    log "!!!! 当前残留：$(lsmod | grep -E '^nvidia' | tr '\n' '|')"
+    log "!!!! 仍被占用的进程：$(fuser -v /dev/nvidia* 2>&1 | tail -n +2 | tr '\n' ' ')"
+    return 1
+}
+
+# ---------- 中止时回滚宿主，别把机器丢在半死状态 ----------
+restore_host() {
+    log "回滚：重新加载 nvidia 并恢复桌面"
+    modprobe nvidia 2>/dev/null
+    modprobe nvidia_modeset 2>/dev/null
+    modprobe nvidia_drm 2>/dev/null
+    modprobe nvidia_uvm 2>/dev/null
+    systemctl start nvidia-persistenced.service 2>/dev/null
+    sleep 1
+    systemctl isolate graphical.target 2>/dev/null
+    DMX=$(dm_name); [ -n "$DMX" ] && systemctl start "$DMX" 2>/dev/null
+    # 清掉状态文件，避免随后的 release 误操作
+    rm -f "$STATE_DIR"/0000:* "$STATE_DIR/gpu_taken" 2>/dev/null
+}
+
+wait_unbind() {
+    local d i
+    for d in "$@"; do
+        for i in $(seq 1 20); do
+            [ -z "$(cur_driver "$d")" ] && break
+            sleep 0.5
+        done
+    done
+}
+
+case "$ACTION" in
+prepare)
+    log "==================== prepare 开始 ===================="
+    safety_check || { log "prepare 中止（安全护栏）"; exit 1; }
+
+    # 记录原始驱动，供 release 还原
+    for d in $ALL; do
+        cur=$(cur_driver "$d")
+        echo "${cur:-none}" > "$STATE_DIR/$d.drv"
+        if [ "$cur" = "vfio-pci" ]; then
+            echo boot > "$STATE_DIR/$d"
+        else
+            echo hook > "$STATE_DIR/$d"
+        fi
+        log "$d 当前驱动 ${cur:-无}"
+    done
+
+    took_gpu=0
+    if [ "$(cat "$STATE_DIR/0000:01:00.0" 2>/dev/null)" = "hook" ]; then
+        took_gpu=1
+        stop_desktop
+        release_fbcon
+        if ! unload_nvidia; then
+            log "!!!! 为保护宿主机，中止 prepare（VM 不会启动，但机器不会挂）"
+            log "!!!! 请把本日志给我，我按残留占用者调整方案"
+            restore_host
+            exit 1
+        fi
+        # 安全闸：/proc/fb 必须为空。还有 framebuffer 注册 = 还有东西在碰这块显存，
+        # 此时把 GPU 交给 vfio 会重演整机挂死。
+        FB=$(cat /proc/fb 2>/dev/null | tr -d ' \n')
+        if [ -n "$FB" ]; then
+            log "!!!! 安全闸拦截：/proc/fb 非空 = '$FB'，仍存在内核 framebuffer"
+            log "!!!! 中止 prepare，避免宿主机挂死。请把本日志给我。"
+            restore_host
+            exit 1
+        fi
+        log "安全闸通过：/proc/fb 已空，内核 framebuffer 已彻底释放"
+    fi
+
+    # 解绑其余 hook 模式设备（GPU 此时通常已无驱动，幂等）
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        old=$(cur_driver "$d")
+        if [ -n "$old" ]; then
+            echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null \
+                && log "$d 已从 $old 解绑" || log "!! $d 从 $old 解绑失败"
+        fi
+    done
+    wait_unbind $ALL
+
+    log "内核 framebuffer 现状: $(cat /proc/fb 2>/dev/null | tr '\n' ' ')(空=已释放)"
+
+    # 统一绑到 vfio-pci
+    # 逐个绑定 + 每步强制落盘 + 留间隔：万一整机在这里死锁，
+    # 最后一条日志就能精确指出是哪个设备。
+    log "加载 vfio-pci 模块"
+    modprobe vfio-pci 2>/dev/null
+    log "  vfio 模块数: $(lsmod | grep -cE '^vfio')"
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        log "  → 即将把 $d 绑定到 vfio-pci"
+        echo vfio-pci > "/sys/bus/pci/devices/$d/driver_override" 2>/dev/null
+        if echo "$d" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+            log "  ✓ $d 已绑定 vfio-pci"
+        else
+            log "  !! $d 绑定 vfio-pci 失败，当前 $(cur_driver "$d" 2>/dev/null || echo 无)"
+        fi
+        sleep 2
+    done
+
+    echo "$took_gpu" > "$STATE_DIR/gpu_taken"
+    log "==================== prepare 完成（gpu_taken=$took_gpu）===================="
+    ;;
+
+release)
+    log "==================== release 开始 ===================="
+
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        [ "$(cur_driver "$d")" = "vfio-pci" ] && echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null
+        echo "" > "/sys/bus/pci/devices/$d/driver_override" 2>/dev/null
+    done
+    wait_unbind $ALL
+
+    # 重新加载 nvidia（modprobe 会自动带出依赖链）
+    log "重新加载 nvidia 模块"
+    modprobe nvidia 2>/dev/null
+    modprobe nvidia_modeset 2>/dev/null
+    modprobe nvidia_drm 2>/dev/null
+    modprobe nvidia_uvm 2>/dev/null
+    sleep 1
+    log "  01:00.0 当前驱动 $(cur_driver 0000:01:00.0 2>/dev/null || echo 无)"
+
+    # 还原各设备原驱动
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        drv=$(cat "$STATE_DIR/$d.drv" 2>/dev/null)
+        [ -z "$drv" ] || [ "$drv" = "none" ] && drv=nvidia
+        if [ -n "$(cur_driver "$d")" ]; then
+            log "$d 已自动回到 $(cur_driver "$d")"
+        elif [ -d "/sys/bus/pci/drivers/$drv" ]; then
+            echo "$d" > "/sys/bus/pci/drivers/$drv/bind" 2>/dev/null \
+                && log "$d 已还原到 $drv" || log "!! $d 还原 $drv 失败"
+        else
+            log "!! 驱动 $drv 不存在"
+        fi
+        rm -f "$STATE_DIR/$d" "$STATE_DIR/$d.drv"
+    done
+
+    systemctl start nvidia-persistenced.service 2>/dev/null
+
+    if [ "$(cat "$STATE_DIR/gpu_taken" 2>/dev/null)" = "1" ]; then
+        sleep 2
+        systemctl isolate graphical.target 2>/dev/null
+        DMX=$(dm_name)
+        [ -n "$DMX" ] && systemctl start "$DMX" 2>/dev/null
+        log "图形 target 已恢复（$DMX）"
+    fi
+    rm -f "$STATE_DIR/gpu_taken"
+    log "==================== release 完成 ===================="
+    ;;
+*)
+    log "未知动作: $ACTION"
+    ;;
+esac
+exit 0

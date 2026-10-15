@@ -1,0 +1,185 @@
+#!/bin/bash
+# ============================================================
+# libvirt hook —— win10-game 单显卡直通：设备动态绑定管理
+# 由 libvirtd 自动调用: /etc/libvirt/hooks/qemu <domain> <action>
+#
+#   prepare  VM 启动前：停图形 target 释放 GPU → 解绑 GPU/NVMe/USB → 绑 vfio-pci
+#   release  VM 退出后：解绑 vfio → 还原宿主机原驱动 → 恢复图形 target
+#
+# 【硬性约束 —— 都是踩过的坑，别改】
+#   1. 不用 loginctl terminate-session：hook 跑在 libvirtd 的进程树里，
+#      terminate 图形会话会把 hook 自己一起杀掉，导致 virsh start 中断、VM 起不来。
+#      改用 systemctl isolate multi-user.target。
+#   2. NVME 必须是 0000:02:00.0（Biwin 476G）。
+#      0000:03:00.0 是 Linux 根盘，直通它 = 宿主机当场挂死。
+#      下面有 safety_check() 兜底，发现盘上有挂载就拒绝启动。
+#
+# 日志: /run/vm-passthrough/hook.log
+# ============================================================
+VM="win10-game"
+[ "$1" = "$VM" ] || exit 0
+ACTION="$2"
+
+GPU="0000:01:00.0 0000:01:00.1"
+NVME="0000:02:00.0"
+USB="0000:00:14.0 0000:00:14.2"
+ALL="$GPU $NVME $USB"
+STATE_DIR=/run/vm-passthrough
+LOG="$STATE_DIR/hook.log"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+log() { echo "$(date '+%F %T') [$ACTION] $*" >> "$LOG" 2>/dev/null; }
+cur_driver() { readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null | xargs -r basename; }
+dm_name() { readlink -f /etc/systemd/system/display-manager.service 2>/dev/null | xargs -r basename; }
+
+# ---------- 保险：拒绝把承载已挂载文件系统的存储设备直通出去 ----------
+# 这是防止「根盘被直通 → 宿主机挂死」的最后一道防线
+safety_check() {
+    local d b name bad=0
+    for d in $NVME; do
+        for b in /sys/bus/pci/devices/$d/nvme/*/block/* /sys/bus/pci/devices/$d/block/*; do
+            [ -e "$b" ] || continue
+            name=$(basename "$b")
+            if grep -q "^/dev/$name" /proc/mounts; then
+                log "!!!! 拒绝直通 $d ($name)：其上有已挂载的文件系统（可能是根盘！）"
+                bad=1
+            fi
+        done
+    done
+    if [ "$bad" = 1 ]; then
+        log "!!!! safety_check 未通过，中止 prepare。VM 不会启动，宿主机保持完好。"
+        return 1
+    fi
+    return 0
+}
+
+stop_desktop() {
+    log "停图形 target（不 terminate 会话，避免自杀）"
+    systemctl isolate multi-user.target 2>/dev/null
+    local dm
+    dm=$(dm_name)
+    [ -n "$dm" ] && systemctl stop "$dm" 2>/dev/null
+    systemctl stop nvidia-persistenced 2>/dev/null
+    # framebuffer 若绑在 nvidia 上，nvidia 无法解绑 —— 先解掉 vtconsole
+    local vc
+    for vc in /sys/class/vtconsole/vtcon*; do
+        if grep -qi nvidia "$vc/bind" 2>/dev/null; then
+            echo 0 > "$vc/bind" 2>/dev/null && log "vtconsole $(basename $vc) 已解绑"
+        fi
+    done
+    sleep 2
+}
+
+start_desktop() {
+    local dm
+    dm=$(dm_name)
+    if [ -n "$dm" ]; then
+        systemctl isolate graphical.target 2>/dev/null
+        systemctl start "$dm" 2>/dev/null
+        log "图形 target 已恢复（$dm）"
+    fi
+}
+
+wait_unbind() {
+    local d i
+    for d in "$@"; do
+        for i in $(seq 1 20); do
+            [ -z "$(cur_driver "$d")" ] && break
+            sleep 0.5
+        done
+    done
+}
+
+case "$ACTION" in
+prepare)
+    log "===== prepare 开始 ====="
+
+    safety_check || exit 1
+
+    # 判定每个设备是 hook 模式（当前在宿主驱动上）还是开机绑定模式（已在 vfio）
+    took_gpu=0
+    for d in $ALL; do
+        cur=$(cur_driver "$d")
+        if [ "$cur" = "vfio-pci" ]; then
+            echo boot > "$STATE_DIR/$d"
+            log "$d 已是 vfio-pci（开机绑定模式，不动）"
+        else
+            echo "${cur:-none}" > "$STATE_DIR/$d.drv"
+            echo hook > "$STATE_DIR/$d"
+            log "$d 当前驱动 ${cur:-无} → 需接管"
+        fi
+    done
+
+    # 只有确实要从桌面拿走 GPU 时，才停桌面
+    if [ "$(cat "$STATE_DIR/0000:01:00.0" 2>/dev/null)" = "hook" ]; then
+        stop_desktop
+        took_gpu=1
+    fi
+
+    # 解绑 hook 模式的设备
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        old=$(cur_driver "$d")
+        if [ -n "$old" ]; then
+            if echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null; then
+                log "$d 已从 $old 解绑"
+            else
+                log "!! $d 从 $old 解绑失败"
+            fi
+        fi
+    done
+    wait_unbind $ALL
+
+    # 统一绑到 vfio-pci
+    modprobe vfio-pci 2>/dev/null
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        echo vfio-pci > "/sys/bus/pci/devices/$d/driver_override" 2>/dev/null
+        if echo "$d" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+            log "$d 已绑定 vfio-pci"
+        else
+            log "!! $d 绑定 vfio-pci 失败，当前驱动 $(cur_driver "$d" 2>/dev/null || echo 无)"
+        fi
+    done
+
+    echo "$took_gpu" > "$STATE_DIR/gpu_taken"
+    log "===== prepare 完成（gpu_taken=$took_gpu）====="
+    ;;
+
+release)
+    log "===== release 开始 ====="
+
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        [ "$(cur_driver "$d")" = "vfio-pci" ] && echo "$d" > "/sys/bus/pci/devices/$d/driver/unbind" 2>/dev/null
+        echo "" > "/sys/bus/pci/devices/$d/driver_override" 2>/dev/null
+    done
+    wait_unbind $ALL
+
+    for d in $ALL; do
+        [ "$(cat "$STATE_DIR/$d" 2>/dev/null)" = "hook" ] || continue
+        drv=$(cat "$STATE_DIR/$d.drv" 2>/dev/null)
+        [ -z "$drv" ] || [ "$drv" = "none" ] && drv=nvidia
+        if [ -d "/sys/bus/pci/drivers/$drv" ]; then
+            echo "$d" > "/sys/bus/pci/drivers/$drv/bind" 2>/dev/null \
+                && log "$d 已还原到 $drv" \
+                || log "!! $d 还原 $drv 失败"
+        else
+            log "!! 驱动 $drv 不存在，尝试 modprobe"
+            modprobe "$drv" 2>/dev/null && echo "$d" > "/sys/bus/pci/drivers/$drv/bind" 2>/dev/null
+        fi
+        rm -f "$STATE_DIR/$d" "$STATE_DIR/$d.drv"
+    done
+
+    if [ "$(cat "$STATE_DIR/gpu_taken" 2>/dev/null)" = "1" ]; then
+        sleep 2
+        start_desktop
+    fi
+    rm -f "$STATE_DIR/gpu_taken"
+    log "===== release 完成 ====="
+    ;;
+*)
+    log "未知动作: $ACTION"
+    ;;
+esac
+exit 0

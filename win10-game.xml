@@ -1,0 +1,156 @@
+<domain type='kvm'>
+  <name>win10-game</name>
+  <memory unit='GiB'>16</memory>
+  <currentMemory unit='GiB'>16</currentMemory>
+  <vcpu placement='static'>12</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.fd</loader>
+    <nvram>/etc/libvirt/qemu/nvram/win10-game_VARS.fd</nvram>
+    <!-- 启动顺序改用设备级 <boot order='n'/> 显式指定（见 cdrom 段），
+         不再用 <boot dev='x'/>：后者不会给 cdrom 产生 bootindex，
+         导致 OVMF 沿用 NVRAM 里的旧引导顺序。 -->
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <!-- 隐藏 KVM 签名：CPUID 0x40000000 不再返回 KVMKVMKVM -->
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+  </features>
+
+  <!-- 宿主 CPU 原样透传 + 关闭 hypervisor 位：nvidia 无 Code 43，反作弊 CPUID 检查看不到虚拟化 -->
+  <cpu mode='host-passthrough' check='none'>
+    <topology sockets='1' dies='1' cores='6' threads='2'/>
+    <feature policy='disable' name='hypervisor'/>
+  </cpu>
+
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+
+  <!-- SMBIOS 透传真实主板信息（技嘉 B760M H DDR4 / AMI F14），伪装成物理机 -->
+  <sysinfo type='smbios'>
+    <bios>
+      <entry name='vendor'>American Megatrends International, LLC.</entry>
+      <entry name='version'>F14</entry>
+      <entry name='date'>09/12/2024</entry>
+    </bios>
+    <system>
+      <entry name='manufacturer'>Gigabyte Technology Co., Ltd.</entry>
+      <entry name='product'>B760M H DDR4</entry>
+      <entry name='version'>-CF</entry>
+      <entry name='serial'>GBB760M2409170CF</entry>
+      <entry name='uuid'>9f8e7d6c-5b4a-4938-8217-3e2d1c0b9a8f</entry>
+      <entry name='sku'>Default string</entry>
+      <entry name='family'>B760M H DDR4</entry>
+    </system>
+    <baseBoard>
+      <entry name='manufacturer'>Gigabyte Technology Co., Ltd.</entry>
+      <entry name='product'>B760M H DDR4</entry>
+      <entry name='version'>x.x</entry>
+      <entry name='serial'>GBB760M2409170CF</entry>
+    </baseBoard>
+  </sysinfo>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+
+  <devices>
+    <!-- RTX 3050 6GB（运行时由 libvirt hook 动态绑定 vfio） -->
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+      </source>
+    </hostdev>
+    <!-- RTX 3050 HDMI 音频 -->
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x1'/>
+      </source>
+    </hostdev>
+    <!-- 第二块 NVMe 整盘直通：KINGSTON SNV2S250G (232.9G) / 0000:02:00.0
+         （用户 2026-10-14 从 Ugreen USB 硬盘盒拆出，直接插到主板 M.2 槽，
+           替换掉原来那块装着蓝屏 Windows 的 Acer N3500CN。PCI ID 2646:5017。）
+         → 全新安装 Win10 到这块盘上。 -->
+    <!-- ★★★ 绝不要改成 0x03：0000:03:00.0 是 Linux 根盘（JUHOR J3500），直通它会让宿主机当场挂死 ★★★ -->
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x02' slot='0x00' function='0x0'/>
+      </source>
+    </hostdev>
+    <!-- ★★★ 绝对不要再直通 USB 控制器！★★★
+         实测（2026-10-14，用测试 VM 稳定复现）：直通 Intel XHCI（0000:00:14.0）会让
+         OVMF 在 TianoCore logo 处死等，**永远进不去安装程序**（截图与用户实拍一致）。
+         根因：该控制器不支持任何复位方式（无 reset_method；QEMU 每次都报
+         "Cannot reset device ... no available reset mechanism"），
+         状态在多次虚拟机运行之间"带脏"，OVMF 的 XhciDxe 一上来就卡死；
+         连 remove+rescan 强制重新初始化都无法清除。
+         替代方案（已在本机测试 VM 验证通过）：
+           客户机用一块 NEC/Renesas uPD720200（PCI 1033:0194）模拟 USB3 控制器
+           —— 真实存在、极常见的 PCIe 扩展卡芯片，不带 QEMU 的 1b36:xxxx 虚拟化痕迹；
+           真实键鼠以「设备级直通」挂上去，键鼠即插即用，VM 退出时自动归还宿主机。
+         （0000:00:14.2 是 PCH Shared SRAM，宿主专用、本身无驱动，直通它毫无意义，一并去掉。） -->
+    <controller type='usb' index='0' model='nec-xhci'/>
+    <!-- 键盘：Compx 2.4G 无线接收器 -->
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x3554'/>
+        <product id='0xfa09'/>
+      </source>
+    </hostdev>
+    <!-- 鼠标：Logitech G502 HERO -->
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x046d'/>
+        <product id='0xc08b'/>
+      </source>
+    </hostdev>
+
+    <!-- 网卡：e1000e 仿真 Intel 千兆 + 伪造 Intel OUI MAC（避开 QEMU 默认 52:54:00），走默认 NAT -->
+    <interface type='network'>
+      <mac address='00:1b:77:4a:2c:9d'/>
+      <source network='default'/>
+      <model type='e1000e'/>
+    </interface>
+
+    <!-- 虚拟 TPM 2.0（swtpm） -->
+    <tpm model='tpm-tis'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+
+    <!-- 安装光盘：/opt/win10-noprompt.iso
+         它由 /opt/win10.iso 复制而来，只改了一处：把 El Torito 的 UEFI 引导镜像
+         从 efisys.bin（会显示 "Press any key to boot from CD or DVD..."，不按时跳到下一设备，
+         装系统时常因此进不去安装界面）换成 efisys_noprompt.bin（直接进安装程序）。
+         偏移 1056768 处那 1474560 字节已校验为无提示版；原镜像保持不动。
+         ★ 装完系统后必须删除本段（或去掉 boot order），否则每次开机都会引导到安装程序。 -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/opt/win10-noprompt.iso'/>
+      <target dev='sda' bus='sata'/>
+      <boot order='1'/>
+      <readonly/>
+    </disk>
+
+    <!-- 刻意不挂：仿真显卡 / virtio 气球 / 任何半虚拟化设备 -->
+    <video>
+      <model type='none'/>
+    </video>
+    <memballoon model='none'/>
+  </devices>
+</domain>
